@@ -1,0 +1,20 @@
+# Builds and IDE state
+/build/
+/cmake-build-*/
+/.idea/
+/.vs/
+*.user
+
+# Generated disk images, recovery data, and local test reports
+*.img
+*.vhd
+*.vhdx
+/test-results/
+/*-recovery-*/
+/live-*.log
+/live-test-*.txt
+/live-chkdsk-*.log
+
+# Python caches
+__pycache__/
+*.py[cod]
