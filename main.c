@@ -17,6 +17,7 @@ static void usage(void) {
          "       exfat_shrink hashes IMAGE\n"
          "       exfat_shrink compare-files SOURCE_IMAGE OTHER_IMAGE\n"
          "       exfat_shrink shrink-live DRIVE_LETTER TARGET_BYTES NEW_RECOVERY_DIRECTORY\n"
+         "       exfat_shrink recover-live DRIVE_LETTER RECOVERY_DIRECTORY\n"
          "Image commands require an exFAT boot sector at byte 0. Live mode requires administrator "
          "access.");
 }
@@ -25,6 +26,10 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--help")) {
         usage();
         return 0;
+    }
+
+    if (argc == 4 && !strcmp(argv[1], "recover-live")) {
+        return exfat_recover_live(argv[2], argv[3]);
     }
 
     if (argc == 4 && !strcmp(argv[1], "compare-files")) {

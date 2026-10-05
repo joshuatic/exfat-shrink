@@ -1,8 +1,10 @@
 # exfat-shrink
 
+> **Experimental, extensively tested** exFAT shrinker with transactional live resizing and integrity verification.
+
 A small C17 CLI for exFAT shrinking, with separate source files and mandatory
 SHA-256 verification. It supports offline image copies and experimental Windows
-live partition shrinking. A Windows Clang Release build is approximately 47 KiB.
+live partition shrinking. A Windows Clang Release build is approximately 54 KiB.
 
 The current algorithm removes an **empty tail**. It does not relocate clusters:
 free capacity alone does not guarantee a volume can shrink to a particular size.
@@ -70,8 +72,22 @@ GB requires multiple complete reads and can take hours.
 
 Keep `metadata-journal.bin`, `layout-before.bin`, and `state.txt` after an operation.
 Process failures attempt rollback and verify restored sectors and disk layout.
-Power-loss recovery is currently manual: automatic journal replay and restart
-recovery are not implemented. The journal covers metadata this operation changes;
+For an interrupted GPT transaction, explicitly restore the original partition with:
+
+```powershell
+exfat_shrink recover-live X C:\transaction-recovery-directory
+```
+
+Recovery verifies the journal/layout SHA-256, disk and partition identities,
+neighboring partitions, sector bounds and ordering, and the proposed original
+filesystem before writing. It refuses committed transactions, unsupported journal
+versions, or sectors matching neither recorded version. It verifies restored
+metadata and current file contents afterward. Repeat replay is supported. Recovery
+is currently GPT-only and requires the volume to retain a usable drive letter;
+it does not automatically run at startup or repair torn/unrecognized sector writes.
+The journal checksum detects accidental corruption; it is not authentication.
+Recovery checks current file contents before/after restoration, not a persisted
+pre-crash file-hash baseline. The journal covers metadata this operation changes;
 it cannot restore unrelated media damage or replace a file backup. This is an
 experimental tool, not a proven general-purpose partition manager.
 
@@ -96,7 +112,7 @@ zero-filled blocks.
 
 ## Tests
 
-CTest runs 103 fixture and hash checks, including corruption rejection, independent
+CTest runs the original 103 checks plus an extended deterministic suite, including corruption rejection, independent
 SHA-256 vectors, file preservation, 512/4096-byte sector overlays, unchanged tails,
 and byte-exact metadata rollback.
 
@@ -112,10 +128,12 @@ exFAT, and writes files with independent expected hashes. It exercises failures
 after dirty marking, filesystem writes, and partition resizing, followed by a
 successful shrink to 24 MiB. Each phase checks CHKDSK, expected file hashes,
 partition identity and size, and an untouched neighboring partition. It uses
-under 70 MiB of temporary image storage and removes images after success. Failed
+about 100 MiB of temporary image storage when recovery-storage tests run and removes images after success. Failed
 runs retain diagnostics. Fault injection exists only in `exfat_fault_test`.
 
-The no-copy transaction tests passed with a 46,480-byte journal. Earlier testing
+The original no-copy transaction test used a 46,480-byte journal. Journals now
+include a 32-byte checksum bound to the saved layout. See [TESTING.md](TESTING.md)
+for the current coverage matrix and verification results. Earlier testing
 also shrank a physical approximately 16 GiB partition to 2 GiB, preserving 1,057
 files and all 1,053 independent manifest hashes, with CHKDSK passing. These results
 do not establish reliability for arbitrary volumes or a 750 GB deployment.
@@ -135,5 +153,5 @@ by Git. No personal drive manifests or local test-result folders are included.
 - `test_*.c`, `test_*.py`, `test_live_partition.ps1`: regression tests.
 - `make_test_vhd.py`, `verify_image_hashes.py`: independent test utilities.
 
-Next milestones are automatic crash recovery, broader format and fault coverage,
+Next milestones are recovery without a drive letter, torn-write and broader fault coverage,
 and cluster relocation with bounded storage and exhaustive fragmented-volume tests.

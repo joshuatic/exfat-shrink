@@ -36,6 +36,8 @@ def write_gpt(output, disk_size, partition_size, partition_start):
         (0, 'e3c9e316-0b5c-4db8-817d-f92df00215ae', 34, partition_start - 1, 'Sentinel reserved'),
         (1, 'ebd0a0a2-b9e5-4433-87c0-68b6b72699c7', partition_start,
          partition_start + partition_size // 512 - 1, 'exFAT live test'),
+        (2, 'e3c9e316-0b5c-4db8-817d-f92df00215ae',
+         partition_start + partition_size // 512, sectors - 34, 'Sentinel after'),
     ):
         base = index * 128
         entries[base:base+16] = uuid.UUID(kind).bytes_le
@@ -57,11 +59,13 @@ def write_gpt(output, disk_size, partition_size, partition_start):
         output.write(entries)
 
 
-def make_vhd(image_path, destination, gpt=False):
+def make_vhd(image_path, destination, gpt=False, offset_sectors=2048):
     image_path = Path(image_path).resolve()
     destination = Path(destination).resolve()
     size = image_path.stat().st_size
-    prefix = 1024 * 1024
+    if offset_sectors < 2048:
+        raise ValueError("Test partition offset must leave room for metadata")
+    prefix = offset_sectors * 512
 
     if destination.exists():
         raise ValueError("Destination already exists")
@@ -69,7 +73,7 @@ def make_vhd(image_path, destination, gpt=False):
         raise ValueError("Unsupported MBR image size")
 
     storage = StorageType(2, Guid.from_buffer_copy(uuid.UUID("ec984aec-a0f9-47e9-901f-71415a66345b").bytes_le))
-    disk_size = size + prefix + (prefix if gpt else 0)
+    disk_size = size + prefix + 1024 * 1024
     parameters = CreateParameters(1, 0, Guid(), disk_size, 0, 512, None, None)
     api = ct.WinDLL("virtdisk.dll")
     api.CreateVirtualDisk.argtypes = [ct.POINTER(StorageType), wt.LPCWSTR, wt.DWORD,
@@ -98,6 +102,9 @@ def make_vhd(image_path, destination, gpt=False):
         struct.pack_into("<B3sB3sII", mbr, 446, 0, b"\xfe\xff\xff", 0xee if gpt else 7,
                          b"\xfe\xff\xff", 1 if gpt else prefix // 512,
                          disk_size // 512 - 1 if gpt else size // 512)
+        if not gpt:
+            struct.pack_into("<B3sB3sII", mbr, 462, 0, b"\xfe\xff\xff", 0xda,
+                             b"\xfe\xff\xff", (prefix + size) // 512, 2048)
         mbr[510:512] = b"\x55\xaa"
         output.write(mbr)
         if gpt:
@@ -139,5 +146,6 @@ if __name__ == "__main__":
     parser.add_argument("image")
     parser.add_argument("destination")
     parser.add_argument("--gpt", action="store_true")
+    parser.add_argument("--offset-sectors", type=int, default=2048)
     args = parser.parse_args()
-    make_vhd(args.image, args.destination, args.gpt)
+    make_vhd(args.image, args.destination, args.gpt, args.offset_sectors)

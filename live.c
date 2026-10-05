@@ -2,6 +2,8 @@
 #include "live.h"
 #include "exfat.h"
 #include "patch.h"
+#include "sha256.h"
+#include <sys/stat.h>
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -37,11 +39,19 @@ static void fail(const char *message) {
 
 static void inject_failure(const char *phase) {
 #ifdef EXFAT_TEST_FAULTS
-    char requested[64];
+    char requested[64] = {0};
 
     if (GetEnvironmentVariableA("EXFAT_TEST_FAULT", requested, sizeof(requested)) &&
         !strcmp(requested, phase)) {
         fail(phase);
+    }
+    char crash[80];
+    snprintf(crash, sizeof(crash), "crash-%s", phase);
+    if (!strcmp(requested, "crash-during-rollback") && !strcmp(phase, "after-filesystem")) {
+        fail("injected failure before interrupted rollback");
+    }
+    if (!strcmp(requested, crash)) {
+        TerminateProcess(GetCurrentProcess(), 91);
     }
 #else
     (void)phase;
@@ -76,15 +86,40 @@ static void read_image(FILE *file, uint64_t offset, void *buffer, size_t length)
     }
 }
 
-static void save_state(const char *state) {
-    FILE *file = fopen(state_path, "wb");
-
-    if (!file || fprintf(file, "%s\n", state) < 0 || fflush(file) || _commit(_fileno(file))) {
-        fail("cannot persist transaction state");
+static void journal_digest(FILE *file, uint64_t length, unsigned char digest[32]) {
+    Sha256 hash;
+    sha256_init(&hash);
+    sha256_update(&hash, initial_layout, initial_layout_bytes);
+    unsigned char buffer[65536];
+    for (uint64_t offset = 0; offset < length;) {
+        size_t take = (size_t)(length - offset < sizeof(buffer) ? length - offset : sizeof(buffer));
+        read_image(file, offset, buffer, take);
+        sha256_update(&hash, buffer, take);
+        offset += take;
     }
+    sha256_finish(&hash, digest);
+}
 
+static int persist_state(const char *state) {
+    char temporary[MAX_PATH];
+    if (snprintf(temporary, sizeof(temporary), "%s.new", state_path) >= (int)sizeof(temporary)) {
+        return 0;
+    }
+    FILE *file = _fsopen(temporary, "wb", _SH_DENYRW);
+    if (!file) {
+        return 0;
+    }
+    int saved = fprintf(file, "%s\n", state) >= 0 && !fflush(file) && !_commit(_fileno(file));
     if (fclose(file)) {
-        fail("cannot close transaction state");
+        saved = 0;
+    }
+    return saved &&
+           MoveFileExA(temporary, state_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+}
+
+static void save_state(const char *state) {
+    if (!persist_state(state)) {
+        fail("cannot atomically persist transaction state");
     }
 }
 
@@ -220,6 +255,7 @@ static void cleanup(void) {
                     restored = 0;
                     break;
                 }
+                inject_failure("during-rollback");
             }
 
             if (!FlushFileBuffers(live_disk)) {
@@ -249,16 +285,10 @@ static void cleanup(void) {
             restored
                 ? "Rollback writes completed. Recheck the volume before reuse.\n"
                 : "Rollback incomplete. Keep the recovery directory and restore before reuse.\n");
-        FILE *state = fopen(state_path, "wb");
-
-        if (state) {
-            fputs(restored
-                      ? "ROLLED_BACK: process failure; recheck restored volume before reuse\n"
-                      : "RECOVERY_REQUIRED: rollback incomplete; preserve all recovery files\n",
-                  state);
-            fflush(state);
-            _commit(_fileno(state));
-            fclose(state);
+        if (!persist_state(
+                restored ? "ROLLED_BACK: process failure; recheck restored volume before reuse"
+                         : "RECOVERY_REQUIRED: rollback incomplete; preserve all recovery files")) {
+            fprintf(stderr, "warning: rollback state publication failed; retain recovery files\n");
         }
     }
 
@@ -499,19 +529,20 @@ int exfat_shrink_live(const char *drive, uint64_t target, const char *directory)
     }
 
     uint64_t journal_bytes =
-        5 * sizeof(uint64_t) + plan.count * (sizeof(uint64_t) + 2ull * sector_bytes);
+        5 * sizeof(uint64_t) + plan.count * (sizeof(uint64_t) + 2ull * sector_bytes) + 32;
     if (!GetDiskFreeSpaceExA(recovery_root, &free_bytes, NULL, NULL) ||
         free_bytes.QuadPart < journal_bytes + 1024 * 1024) {
         fail("insufficient free space for metadata journal; volume unchanged");
     }
-    FILE *journal = _fsopen(journal_path, "wbx", _SH_DENYRW);
+    inject_failure("before-journal");
+    FILE *journal = _fsopen(journal_path, "w+bx", _SH_DENYRW);
     unsigned char *a = malloc(sector_bytes);
     unsigned char *b = malloc(sector_bytes);
     changes = malloc(plan.count * sizeof(*changes));
     if (!journal || !a || !b || !changes) {
         fail("cannot create metadata journal");
     }
-    const uint64_t header[5] = {UINT64_C(0x31304a5441465845), sector_bytes, old_length, target,
+    const uint64_t header[5] = {UINT64_C(0x32304a5441465845), sector_bytes, old_length, target,
                                 (uint64_t)selected.StartingOffset.QuadPart};
     if (fwrite(header, 1, sizeof(header), journal) != sizeof(header)) {
         fail("journal header write failed");
@@ -525,12 +556,27 @@ int exfat_shrink_live(const char *drive, uint64_t target, const char *directory)
             fail("journal write failed");
         }
     }
+    if (fflush(journal)) {
+        fail("journal flush failed");
+    }
+    unsigned char digest[32];
+    journal_digest(journal, journal_bytes - 32, digest);
+    if (_fseeki64(journal, (int64_t)(journal_bytes - 32), SEEK_SET) ||
+        fwrite(digest, 1, sizeof(digest), journal) != sizeof(digest)) {
+        fail("journal checksum write failed");
+    }
     if (fflush(journal) || _commit(_fileno(journal)) || fclose(journal)) {
         fail("journal flush failed");
     }
     original = _fsopen(journal_path, "rb", _SH_DENYWR);
     if (!original) {
         fail("cannot reopen durable journal");
+    }
+    unsigned char stored_digest[32], checked_digest[32];
+    read_image(original, journal_bytes - 32, stored_digest, sizeof(stored_digest));
+    journal_digest(original, journal_bytes - 32, checked_digest);
+    if (memcmp(stored_digest, checked_digest, sizeof(stored_digest))) {
+        fail("durable journal checksum mismatch; volume unchanged");
     }
     /* Verify every record on disk against the validated in-memory plan. */
     for (size_t i = 0; i < plan.count; i++) {
@@ -557,6 +603,7 @@ int exfat_shrink_live(const char *drive, uint64_t target, const char *directory)
 
     free(current);
     save_state("JOURNALED: originals and replacements durable; live writes about to begin");
+    inject_failure("after-journal");
     writes_started = 1;
 
     /* Mark both boot sectors dirty before any metadata update. */
@@ -580,6 +627,7 @@ int exfat_shrink_live(const char *drive, uint64_t target, const char *directory)
                "original size");
 
     /* Update non-boot sectors, then backup boot region, then main boot region. */
+    size_t applied = 0;
     for (unsigned pass = 0; pass < 3; pass++) {
         for (size_t i = 0; i < change_count; i++) {
             uint64_t offset = changes[i];
@@ -595,6 +643,13 @@ int exfat_shrink_live(const char *drive, uint64_t target, const char *directory)
 
             if (!raw_io(live_volume, offset, b, sector_bytes, 1)) {
                 fail("live metadata update failed");
+            }
+            applied++;
+            if (applied == 1) {
+                inject_failure("after-first-write");
+            }
+            if (applied == change_count / 2) {
+                inject_failure("halfway-writes");
             }
         }
 
@@ -650,6 +705,190 @@ int exfat_shrink_live(const char *drive, uint64_t target, const char *directory)
     return 0;
 }
 
+int exfat_recover_live(const char *drive, const char *directory) {
+    if (!drive[0] || drive[1] ||
+        !((drive[0] >= 'A' && drive[0] <= 'Z') || (drive[0] >= 'a' && drive[0] <= 'z'))) {
+        fail("recovery drive must be one drive letter");
+    }
+    char letter = (char)(drive[0] & ~32);
+    char windows[MAX_PATH];
+    if (!GetWindowsDirectoryA(windows, MAX_PATH) || (windows[0] & ~32) == letter) {
+        fail("refusing Windows volume recovery");
+    }
+    char journal_path[MAX_PATH], layout_path[MAX_PATH];
+    make_path(journal_path, directory, "metadata-journal.bin");
+    make_path(layout_path, directory, "layout-before.bin");
+    make_path(state_path, directory, "state.txt");
+    FILE *state = _fsopen(state_path, "rb", _SH_DENYWR);
+    char status[256] = {0};
+    if (!state || !fgets(status, sizeof(status), state)) {
+        fail("cannot read transaction state");
+    }
+    fclose(state);
+    if (!strncmp(status, "COMMITTED", 9) || !strncmp(status, "PREPARING", 9)) {
+        fail("transaction is committed or never began; recovery refused");
+    }
+    original = _fsopen(journal_path, "rb", _SH_DENYWR);
+    FILE *layout_file = _fsopen(layout_path, "rb", _SH_DENYWR);
+    struct _stat64 journal_stat, layout_stat;
+    if (!original || !layout_file || _fstat64(_fileno(original), &journal_stat) ||
+        _fstat64(_fileno(layout_file), &layout_stat) ||
+        layout_stat.st_size < (int64_t)offsetof(DRIVE_LAYOUT_INFORMATION_EX, PartitionEntry) ||
+        layout_stat.st_size > LAYOUT_BYTES || journal_stat.st_size < 72) {
+        fail("invalid recovery file lengths");
+    }
+    initial_layout_bytes = (DWORD)layout_stat.st_size;
+    initial_layout = calloc(1, initial_layout_bytes);
+    if (!initial_layout ||
+        fread(initial_layout, 1, initial_layout_bytes, layout_file) != initial_layout_bytes) {
+        fail("cannot read recovery layout");
+    }
+    fclose(layout_file);
+    if (initial_layout->PartitionCount >
+        (initial_layout_bytes - offsetof(DRIVE_LAYOUT_INFORMATION_EX, PartitionEntry)) /
+            sizeof(PARTITION_INFORMATION_EX)) {
+        fail("recovery layout count exceeds file");
+    }
+    uint64_t header[5];
+    read_image(original, 0, header, sizeof(header));
+    sector_bytes = (DWORD)header[1];
+    uint64_t old_length = header[2], target = header[3];
+    if (header[0] != UINT64_C(0x32304a5441465845) || header[1] != sector_bytes ||
+        sector_bytes < 512 || sector_bytes > 4096 || (sector_bytes & (sector_bytes - 1)) ||
+        target < 24ull * sector_bytes || target >= old_length || target % (1024 * 1024) ||
+        old_length > INT64_MAX || old_length % sector_bytes || header[4] > INT64_MAX) {
+        fail("invalid or unsupported recovery journal header");
+    }
+    uint64_t payload = (uint64_t)journal_stat.st_size - sizeof(header) - 32;
+    uint64_t record_bytes = 8 + 2ull * sector_bytes;
+    if (payload % record_bytes || payload / record_bytes < 24 || payload > 256ull * 1024 * 1024) {
+        fail("invalid recovery record count");
+    }
+    unsigned char expected[32], actual[32];
+    journal_digest(original, (uint64_t)journal_stat.st_size - 32, actual);
+    read_image(original, (uint64_t)journal_stat.st_size - 32, expected, sizeof(expected));
+    if (memcmp(expected, actual, sizeof(actual))) {
+        fail("recovery journal/layout SHA-256 mismatch; no writes performed");
+    }
+    unsigned found = 0;
+    for (DWORD i = 0; i < initial_layout->PartitionCount; i++) {
+        PARTITION_INFORMATION_EX *part = &initial_layout->PartitionEntry[i];
+        if ((uint64_t)part->StartingOffset.QuadPart == header[4] &&
+            (uint64_t)part->PartitionLength.QuadPart == old_length) {
+            selected = *part;
+            found++;
+        }
+    }
+    if (found != 1 || selected.PartitionStyle != PARTITION_STYLE_GPT) {
+        fail("recovery currently requires one uniquely identified GPT partition");
+    }
+    char device[] = "\\\\.\\X:";
+    device[4] = letter;
+    live_volume =
+        CreateFileA(device, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                    OPEN_EXISTING, FILE_FLAG_WRITE_THROUGH, NULL);
+    if (live_volume == INVALID_HANDLE_VALUE) {
+        fail("cannot open recovery volume; run as administrator");
+    }
+    atexit(cleanup);
+    VOLUME_DISK_EXTENTS extents;
+    if (!control(live_volume, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0, &extents,
+                 sizeof(extents), NULL) ||
+        extents.NumberOfDiskExtents != 1 ||
+        (uint64_t)extents.Extents[0].StartingOffset.QuadPart != header[4] ||
+        ((uint64_t)extents.Extents[0].ExtentLength.QuadPart != old_length &&
+         (uint64_t)extents.Extents[0].ExtentLength.QuadPart != target)) {
+        fail("recovery volume does not match recorded extent");
+    }
+    char physical[64];
+    snprintf(physical, sizeof(physical), "\\\\.\\PhysicalDrive%lu", extents.Extents[0].DiskNumber);
+    live_disk =
+        CreateFileA(physical, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    NULL, OPEN_EXISTING, FILE_FLAG_WRITE_THROUGH, NULL);
+    DISK_GEOMETRY geometry;
+    DWORD layout_bytes;
+    DRIVE_LAYOUT_INFORMATION_EX *current = get_layout(&layout_bytes);
+    if (live_disk == INVALID_HANDLE_VALUE || !current ||
+        !same_layout(current, (uint64_t)extents.Extents[0].ExtentLength.QuadPart) ||
+        !control(live_disk, IOCTL_DISK_GET_DRIVE_GEOMETRY, NULL, 0, &geometry, sizeof(geometry),
+                 NULL) ||
+        geometry.BytesPerSector != sector_bytes) {
+        fail("recovery disk identity or layout mismatch");
+    }
+    free(current);
+    if (!control(live_volume, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, NULL) ||
+        !control(live_volume, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, NULL) ||
+        !FlushFileBuffers(live_disk)) {
+        fail("cannot exclusively lock recovery volume and flush disk");
+    }
+    change_count = (size_t)(payload / record_bytes);
+    changes = malloc(change_count * sizeof(*changes));
+    PatchPlan restore = {live_read, NULL, old_length, sector_bytes, NULL, 0, 0};
+    unsigned char before[4096], after[4096], present[4096];
+    if (!changes) {
+        fail("out of memory reading recovery records");
+    }
+    for (size_t i = 0; i < change_count; i++) {
+        read_image(original, sizeof(header) + i * record_bytes, &changes[i], sizeof(changes[i]));
+        uint64_t offset = changes[i];
+        if (offset % sector_bytes || offset > target - sector_bytes ||
+            (i && offset <= changes[i - 1]) || (i < 24 && offset != i * sector_bytes)) {
+            fail("invalid recovery sector ordering or bounds");
+        }
+        read_journal(i, 0, before);
+        read_journal(i, 1, after);
+        live_read(NULL, offset, present, sector_bytes);
+        if (memcmp(present, before, sector_bytes) && memcmp(present, after, sector_bytes)) {
+            /* Dirty marking changes only this mutable flag in the two boot sectors. */
+            if (offset != 0 && offset != 12ull * sector_bytes) {
+                fail("live sector differs from both journal versions; recovery refused");
+            }
+            before[106] |= 2;
+            if (memcmp(present, before, sector_bytes)) {
+                fail("live boot sector differs from journal; recovery refused");
+            }
+            read_journal(i, 0, before);
+        }
+        patch_write(&restore, offset, before, sector_bytes);
+    }
+    FileHashes hashes = {0};
+    if (exfat_validate_reader(patch_read, &restore, old_length, 0, 0, NULL, &hashes)) {
+        fail("restored filesystem plan invalid; no recovery writes performed");
+    }
+    patch_free(&restore);
+    save_state("RECOVERING: verified journal and disk identity; restoring original partition");
+    writes_started = 1;
+    /* Reuse the verified rollback path, then reopen for full filesystem/hash checks. */
+    HANDLE verification_handle;
+    if (!DuplicateHandle(GetCurrentProcess(), live_volume, GetCurrentProcess(),
+                         &verification_handle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        fail("cannot retain verification handle");
+    }
+    cleanup();
+    live_volume = verification_handle;
+    committed = 1;
+    state = fopen(state_path, "rb");
+    memset(status, 0, sizeof(status));
+    if (!state || !fgets(status, sizeof(status), state)) {
+        fail("cannot verify rollback state");
+    }
+    fclose(state);
+    if (strncmp(status, "ROLLED_BACK", 11)) {
+        fail("rollback did not verify; retain recovery files");
+    }
+    file_hash_begin_compare(&hashes);
+    if (exfat_validate_reader(live_read, NULL, old_length, 0, 0, NULL, &hashes) ||
+        file_hash_report(&hashes)) {
+        fail("recovery filesystem or hashes failed; retain journal");
+    }
+    file_hash_free(&hashes);
+    save_state(
+        "RECOVERED: original partition and metadata restored; current file contents verified");
+    cleanup();
+    puts("Recovery complete: original partition restored and all current file contents preserved.");
+    return 0;
+}
+
 #else
 
 int exfat_shrink_live(const char *drive, uint64_t target, const char *directory) {
@@ -658,6 +897,13 @@ int exfat_shrink_live(const char *drive, uint64_t target, const char *directory)
     (void)directory;
     fprintf(stderr, "error: live partition shrinking is supported only on Windows\n");
 
+    return 1;
+}
+
+int exfat_recover_live(const char *drive, const char *directory) {
+    (void)drive;
+    (void)directory;
+    fprintf(stderr, "error: live recovery is supported only on Windows\n");
     return 1;
 }
 

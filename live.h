@@ -8,4 +8,6 @@
  * changes only that partition's length using the Windows disk API. */
 int exfat_shrink_live(const char *drive, uint64_t target_bytes, const char *new_recovery_directory);
 
+int exfat_recover_live(const char *drive, const char *recovery_directory);
+
 #endif
