@@ -2,7 +2,9 @@ param(
     [string]$Python = 'python',
     [ValidateSet('GPT', 'MBR')]
     [string]$PartitionStyle = 'GPT',
-    [uint32]$OffsetSectors = 2048
+    [uint32]$OffsetSectors = 2048,
+    [ValidateRange(2, 16)]
+    [int]$RecoveryReplays = 2
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,6 +17,15 @@ $recoveryVhd = $null
 $recoveryMounted = $false
 $target = 25165824
 $sourceSize = 33554432
+$binaryRoot = Join-Path $PSScriptRoot 'build'
+if (-not (Test-Path -LiteralPath (Join-Path $binaryRoot 'exfat_shrink.exe'))) {
+    $binaryRoot = Join-Path $binaryRoot 'Release'
+}
+$production = Join-Path $binaryRoot 'exfat_shrink.exe'
+$faultProgram = Join-Path $binaryRoot 'exfat_fault_test.exe'
+if (-not (Test-Path -LiteralPath $production) -or -not (Test-Path -LiteralPath $faultProgram)) {
+    throw 'Build the Release production and fault-test executables before running this test.'
+}
 $seed = Join-Path $PSScriptRoot ('live-seed-' + [guid]::NewGuid().ToString('N') + '.img')
 $rows = @()
 
@@ -89,12 +100,12 @@ try {
     $neighbors = @($neighbor | Select-Object PartitionNumber, Size, Offset, Guid)
     $phases = @('before-journal', 'after-journal', 'after-dirty', 'after-first-write', 'halfway-writes', 'after-filesystem', 'after-partition')
     if ($PartitionStyle -eq 'GPT') {
-        $phases += @('crash-after-dirty', 'crash-after-filesystem', 'crash-after-partition', 'crash-during-rollback')
+        $phases += @('crash-after-journal', 'crash-after-first-write', 'crash-after-dirty', 'crash-after-filesystem', 'crash-after-partition', 'crash-during-rollback', 'torn-boot', 'torn-backup')
     }
     foreach ($rejectedDrive in @($env:SystemDrive.Substring(0,1), '\\.\PhysicalDrive0')) {
         $rejectDirectory = Join-Path $PSScriptRoot ('live-recovery-system-' + [guid]::NewGuid().ToString('N'))
         $ErrorActionPreference = 'Continue'
-        & (Join-Path $PSScriptRoot 'build\exfat_shrink.exe') shrink-live $rejectedDrive $target $rejectDirectory 2>&1 |
+        & $production shrink-live $rejectedDrive $target $rejectDirectory 2>&1 |
             Set-Content -LiteralPath (Join-Path $PSScriptRoot 'live-reject-system.log')
         $rejectCode = $LASTEXITCODE
         $ErrorActionPreference = 'Stop'
@@ -105,7 +116,7 @@ try {
         try {
             $rejectDirectory = Join-Path $PSScriptRoot ('live-recovery-readonly-' + [guid]::NewGuid().ToString('N'))
             $ErrorActionPreference = 'Continue'
-            & (Join-Path $PSScriptRoot 'build\exfat_shrink.exe') shrink-live $letter $target $rejectDirectory 2>&1 |
+            & $production shrink-live $letter $target $rejectDirectory 2>&1 |
                 Set-Content -LiteralPath (Join-Path $PSScriptRoot 'live-reject-special-attribute.log')
             $rejectCode = $LASTEXITCODE
             $ErrorActionPreference = 'Stop'
@@ -137,7 +148,7 @@ try {
             }
         } finally { $filler.Dispose() }
         $ErrorActionPreference = 'Continue'
-        & (Join-Path $PSScriptRoot 'build\exfat_shrink.exe') shrink-live $letter $target (Join-Path $recoveryRoot 'full') 2>&1 |
+        & $production shrink-live $letter $target (Join-Path $recoveryRoot 'full') 2>&1 |
             Set-Content -LiteralPath (Join-Path $PSScriptRoot 'live-reject-full-recovery.log')
         $rejectCode = $LASTEXITCODE
         $ErrorActionPreference = 'Stop'
@@ -152,7 +163,7 @@ try {
         $recoveryPartition | Add-PartitionAccessPath -AssignDriveLetter
         $recoveryVolume = $recoveryPartition | Get-Volume
         $ErrorActionPreference = 'Continue'
-        & (Join-Path $PSScriptRoot 'build\exfat_shrink.exe') shrink-live $letter $target ($recoveryVolume.DriveLetter + ':\readonly') 2>&1 |
+        & $production shrink-live $letter $target ($recoveryVolume.DriveLetter + ':\readonly') 2>&1 |
             Set-Content -LiteralPath (Join-Path $PSScriptRoot 'live-reject-readonly-recovery.log')
         $rejectCode = $LASTEXITCODE
         $ErrorActionPreference = 'Stop'
@@ -168,7 +179,7 @@ try {
     try {
         $lockedRecovery = Join-Path $PSScriptRoot ('live-recovery-held-' + [guid]::NewGuid().ToString('N'))
         $ErrorActionPreference = 'Continue'
-        & (Join-Path $PSScriptRoot 'build\exfat_shrink.exe') shrink-live $letter $target $lockedRecovery 2>&1 |
+        & $production shrink-live $letter $target $lockedRecovery 2>&1 |
             Set-Content -LiteralPath (Join-Path $PSScriptRoot 'live-reject-open-handle.log')
         $lockedCode = $LASTEXITCODE
         $ErrorActionPreference = 'Stop'
@@ -179,9 +190,9 @@ try {
         "Testing live partition phase: $phase" | Set-Content -LiteralPath $status
         $recovery = Join-Path $PSScriptRoot ('live-recovery-' + $phase + '-' + [guid]::NewGuid().ToString('N'))
         $log = Join-Path $PSScriptRoot ('live-test-' + $phase + '.log')
-        $program = Join-Path $PSScriptRoot 'build\exfat_fault_test.exe'
+        $program = $faultProgram
         if ($phase -eq 'commit') {
-            $program = Join-Path $PSScriptRoot 'build\exfat_shrink.exe'
+            $program = $production
             Remove-Item Env:\EXFAT_TEST_FAULT -ErrorAction SilentlyContinue
         } else {
             $env:EXFAT_TEST_FAULT = $phase
@@ -208,14 +219,32 @@ try {
         if (($phase -eq 'commit' -and $code -ne 0) -or ($phase -ne 'commit' -and $code -eq 0)) {
             throw "Unexpected live command result for $phase ($code). See $log"
         }
-        if ($phase.StartsWith('crash-')) {
-            $production = Join-Path $PSScriptRoot 'build\exfat_shrink.exe'
+        if ($phase.StartsWith('crash-') -or $phase.StartsWith('torn-')) {
+            $statePath = Join-Path $recovery 'state.txt'
+            $savedState = [IO.File]::ReadAllBytes($statePath)
+            foreach ($stateDamage in @('missing', 'empty', 'truncated', 'unknown', 'committed')) {
+                if ($stateDamage -eq 'missing') { Remove-Item -LiteralPath $statePath }
+                if ($stateDamage -eq 'empty') { [IO.File]::WriteAllBytes($statePath, [byte[]]@()) }
+                if ($stateDamage -eq 'truncated') { [IO.File]::WriteAllBytes($statePath, $savedState[0..3]) }
+                if ($stateDamage -eq 'unknown') { [IO.File]::WriteAllText($statePath, "UNKNOWN: invalid`n", [Text.Encoding]::ASCII) }
+                if ($stateDamage -eq 'committed') { [IO.File]::WriteAllText($statePath, "COMMITTED: stale`n", [Text.Encoding]::ASCII) }
+                $ErrorActionPreference = 'Continue'
+                & $production recover-live $letter $recovery 2>&1 | Set-Content -LiteralPath (Join-Path $PSScriptRoot ('live-reject-state-' + $stateDamage + '.log'))
+                $rejectCode = $LASTEXITCODE
+                $ErrorActionPreference = 'Stop'
+                if ($rejectCode -eq 0) { throw "Invalid $stateDamage state was accepted." }
+                [IO.File]::WriteAllBytes($statePath, $savedState)
+            }
+            # A partially written replacement must not supersede the old durable state.
+            [IO.File]::WriteAllText($statePath + '.new', 'COMMI', [Text.Encoding]::ASCII)
             $journalPath = Join-Path $recovery 'metadata-journal.bin'
             $pristineJournal = [IO.File]::ReadAllBytes($journalPath)
-            foreach ($damage in @('checksum', 'header', 'truncated')) {
+            foreach ($damage in @('checksum', 'header', 'truncated', 'old-version', 'partial-record')) {
                 $journalBytes = [byte[]]$pristineJournal.Clone()
                 if ($damage -eq 'checksum') { $journalBytes[$journalBytes.Length - 1] = $journalBytes[$journalBytes.Length - 1] -bxor 1 }
                 if ($damage -eq 'header') { $journalBytes[0] = $journalBytes[0] -bxor 1 }
+                if ($damage -eq 'old-version') { $journalBytes[7] = $journalBytes[7] -bxor 1 }
+                if ($damage -eq 'partial-record') { $journalBytes = $journalBytes[0..55] }
                 if ($damage -eq 'truncated') { $journalBytes = $journalBytes[0..($journalBytes.Length - 2)] }
                 [IO.File]::WriteAllBytes($journalPath, $journalBytes)
                 $ErrorActionPreference = 'Continue'
@@ -247,13 +276,38 @@ try {
             if ($rejectCode -eq 0) { throw 'Wrong disk journal was accepted.' }
             [IO.File]::WriteAllBytes($layoutPath, $pristineLayout)
             [IO.File]::WriteAllBytes($journalPath, $pristineJournal)
-            foreach ($replay in @(1, 2)) {
+            foreach ($replay in 1..$RecoveryReplays) {
+                $recoverLog = Join-Path $PSScriptRoot ('live-recover-' + $phase + '-' + $replay + '.log')
                 $ErrorActionPreference = 'Continue'
-                & $production recover-live $letter $recovery 2>&1 | Set-Content -LiteralPath (Join-Path $PSScriptRoot ('live-recover-' + $phase + '-' + $replay + '.log'))
+                & $production recover-live $letter $recovery 2>&1 | Set-Content -LiteralPath $recoverLog
                 $recoverCode = $LASTEXITCODE
                 $ErrorActionPreference = 'Stop'
+                for ($attempt = 0; $attempt -lt 3 -and $recoverCode -ne 0; $attempt++) {
+                    # This exact diagnostic occurs before recovery writes. Do not
+                    # retry corruption, identity mismatch or an incomplete restore.
+                    if (-not (Get-Content -LiteralPath $recoverLog -Raw).Contains(
+                        'cannot exclusively lock recovery volume and flush disk')) { break }
+                    Start-Sleep -Milliseconds 500
+                    $ErrorActionPreference = 'Continue'
+                    & $production recover-live $letter $recovery 2>&1 | Set-Content -LiteralPath $recoverLog
+                    $recoverCode = $LASTEXITCODE
+                    $ErrorActionPreference = 'Stop'
+                }
                 if ($recoverCode -ne 0) { throw "Recovery replay $replay failed for $phase." }
             }
+            # A replayable journal must stop being usable after unrelated source
+            # changes. Keep the state valid so this tests the journal/source check.
+            $staleProbe = Join-Path $root 'stale-journal-probe.bin'
+            [IO.File]::WriteAllBytes($staleProbe, [byte[]](7, 8, 9))
+            try {
+                $ErrorActionPreference = 'Continue'
+                & $production recover-live $letter $recovery 2>&1 |
+                    Set-Content -LiteralPath (Join-Path $PSScriptRoot ('live-reject-' + $phase + '-stale.log'))
+                $staleCode = $LASTEXITCODE
+                $ErrorActionPreference = 'Stop'
+                if ($staleCode -eq 0) { throw 'Stale journal after source modification was accepted.' }
+            }
+            finally { Remove-Item -LiteralPath $staleProbe }
         }
         $state = Get-Content -LiteralPath (Join-Path $recovery 'state.txt') -Raw
         if ($phase -notin @('commit', 'before-journal', 'after-journal') -and -not ($state.StartsWith('ROLLED_BACK') -or $state.StartsWith('RECOVERED'))) {
@@ -292,7 +346,7 @@ try {
     foreach ($repeatTarget in @(20971520, 16777216)) {
         $repeatRecovery = Join-Path $PSScriptRoot ('live-recovery-repeat-' + [guid]::NewGuid().ToString('N'))
         $ErrorActionPreference = 'Continue'
-        & (Join-Path $PSScriptRoot 'build\exfat_shrink.exe') shrink-live $letter $repeatTarget $repeatRecovery 2>&1 |
+        & $production shrink-live $letter $repeatTarget $repeatRecovery 2>&1 |
             Set-Content -LiteralPath (Join-Path $PSScriptRoot ('live-repeat-' + $repeatTarget + '.log'))
         $repeatCode = $LASTEXITCODE
         $ErrorActionPreference = 'Stop'
@@ -308,7 +362,7 @@ try {
                 $currentNeighbor.Guid -ne $oldNeighbor.Guid) { throw 'Repeated shrink changed a neighbor.' }
         }
         $ErrorActionPreference = 'Continue'
-        & (Join-Path $PSScriptRoot 'build\exfat_shrink.exe') recover-live $letter $repeatRecovery 2>&1 |
+        & $production recover-live $letter $repeatRecovery 2>&1 |
             Set-Content -LiteralPath (Join-Path $PSScriptRoot 'live-reject-committed.log')
         $committedCode = $LASTEXITCODE
         $ErrorActionPreference = 'Stop'

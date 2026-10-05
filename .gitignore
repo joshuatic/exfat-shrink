@@ -13,6 +13,8 @@
 /*-recovery-*/
 /live-*.log
 /live-test-*.txt
+/live-*-status.txt
+/live-physical-original.xml
 /live-chkdsk-*.log
 
 # Python caches

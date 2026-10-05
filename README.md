@@ -4,7 +4,7 @@
 
 A small C17 CLI for exFAT shrinking, with separate source files and mandatory
 SHA-256 verification. It supports offline image copies and experimental Windows
-live partition shrinking. A Windows Clang Release build is approximately 54 KiB.
+live partition shrinking. A Windows Clang Release build is approximately 56 KiB.
 
 The current algorithm removes an **empty tail**. It does not relocate clusters:
 free capacity alone does not guarantee a volume can shrink to a particular size.
@@ -23,6 +23,10 @@ ctest --test-dir build --output-on-failure
 For multi-configuration generators, add `--config Release` to the build and
 `-C Release` to CTest. Use `-DBUILD_TESTING=OFF` for a production-only build.
 Runtime dependencies depend on the compiler's C runtime configuration.
+The tested Windows binaries import `VCRUNTIME140.dll` and the Windows Universal
+C runtime; those runtime components must be present on the destination PC.
+On Windows, single-configuration builds place the CLI in `build\exfat_shrink.exe`;
+Visual Studio Release builds place it in `build\Release\exfat_shrink.exe`.
 
 ## Commands
 
@@ -81,7 +85,8 @@ exfat_shrink recover-live X C:\transaction-recovery-directory
 Recovery verifies the journal/layout SHA-256, disk and partition identities,
 neighboring partitions, sector bounds and ordering, and the proposed original
 filesystem before writing. It refuses committed transactions, unsupported journal
-versions, or sectors matching neither recorded version. It verifies restored
+versions, or sector bytes outside the recorded old/new values (apart from the
+defined dirty-flag allowance). It verifies restored
 metadata and current file contents afterward. Repeat replay is supported. Recovery
 is currently GPT-only and requires the volume to retain a usable drive letter;
 it does not automatically run at startup or repair torn/unrecognized sector writes.
@@ -138,6 +143,16 @@ also shrank a physical approximately 16 GiB partition to 2 GiB, preserving 1,057
 files and all 1,053 independent manifest hashes, with CHKDSK passing. These results
 do not establish reliability for arbitrary volumes or a 750 GB deployment.
 
+The live harness accepts `-RecoveryReplays 8` for repeated recovery testing and
+finds both single-configuration and Visual Studio Release executable paths.
+`test_physical_partition.ps1 -DriveLetter F` is specific to this development PC's
+small `EXFATTEST` partition on the same SSD as D:. It never formats or creates a
+partition, preserves user files, adds about 34 MiB of test data, shrinks in 16 MiB
+steps, checks hashes/CHKDSK/neighbors and reassigns the drive letter. It requires
+administrator access and a recovery directory on a different physical disk.
+Do not use it as a generic fresh-user disk-creation procedure; use the disposable
+VHD harness above for that purpose.
+
 Generated reports, disk images, recovery files, IDE state, and builds are ignored
 by Git. No personal drive manifests or local test-result folders are included.
 
@@ -150,8 +165,10 @@ by Git. No personal drive manifests or local test-result folders are included.
 - `shrink.c`: offline image copy and verification.
 - `patch.c`: bounded sector overlay.
 - `live.c`: Windows locking, journal, partition resize, and rollback.
+- `recovery_state.c` / `recovery_sector.c`: recovery state and torn-sector validation.
 - `test_*.c`, `test_*.py`, `test_live_partition.ps1`: regression tests.
 - `make_test_vhd.py`, `verify_image_hashes.py`: independent test utilities.
 
-Next milestones are recovery without a drive letter, torn-write and broader fault coverage,
-and cluster relocation with bounded storage and exhaustive fragmented-volume tests.
+Next milestones are durable original hash manifests, recovery without a drive
+letter, actual reboot/power-loss campaigns, and cluster relocation with bounded
+storage. [RELIABILITY.md](RELIABILITY.md) tracks the remaining release gates.

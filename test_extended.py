@@ -149,13 +149,15 @@ with tempfile.TemporaryDirectory() as directory:
                 found = re.findall('^SHA256 ([0-9a-f]{64}) BYTES', run(['hashes', output]).stdout, re.M)
                 assert sorted(found) == sorted(digests)
         assert hashlib.sha256(source.read_bytes()).digest() == original
-    for shift, cshift in ((9, 0), (9, 3), (9, 7), (12, 0), (12, 4)):
+    for shift, cshift in ((9, 0), (9, 3), (9, 6), (9, 7), (9, 8), (9, 9), (12, 0), (12, 4)):
         cluster = 1 << shift << cshift
         for fragmented in (False, True):
-            data, minimum, cluster, digests = image(256, shift, cshift, [0, 1, cluster - 1, cluster, cluster + 1], 30, fragmented)
+            data, minimum, cluster, digests = image(64 if cluster > 65536 else 256, shift, cshift, [0, 1, cluster - 1, cluster, cluster + 1], 30, fragmented)
             case(data, minimum, digests)
             sparse_write(source, data)
-            for target in (minimum - cluster, len(data), minimum + 1):
+            run(['plan', source, minimum + (1 << shift)])
+            run(['plan', source, minimum + cluster])
+            for target in (minimum - (1 << shift), len(data), minimum + 1):
                 run(['plan', source, target], 1)
             case(data, len(data) - cluster, digests)
     for files in (5000, 20000):

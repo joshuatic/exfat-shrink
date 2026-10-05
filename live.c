@@ -2,10 +2,13 @@
 #include "live.h"
 #include "exfat.h"
 #include "patch.h"
+#include "recovery_sector.h"
+#include "recovery_state.h"
 #include "sha256.h"
 #include <sys/stat.h>
 
 #include <inttypes.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -105,7 +108,14 @@ static int persist_state(const char *state) {
     if (snprintf(temporary, sizeof(temporary), "%s.new", state_path) >= (int)sizeof(temporary)) {
         return 0;
     }
-    FILE *file = _fsopen(temporary, "wb", _SH_DENYRW);
+    FILE *file = NULL;
+    for (unsigned attempt = 0; attempt < 16; attempt++) {
+        file = _fsopen(temporary, "wb", _SH_DENYRW);
+        if (file || errno != EACCES) {
+            break;
+        }
+        Sleep(200);
+    }
     if (!file) {
         return 0;
     }
@@ -113,8 +123,20 @@ static int persist_state(const char *state) {
     if (fclose(file)) {
         saved = 0;
     }
-    return saved &&
-           MoveFileExA(temporary, state_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    if (!saved) {
+        return 0;
+    }
+    for (unsigned attempt = 0; attempt < 16; attempt++) {
+        if (MoveFileExA(temporary, state_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            return 1;
+        }
+        DWORD error = GetLastError();
+        if (error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED) {
+            return 0;
+        }
+        Sleep(200);
+    }
+    return 0;
 }
 
 static void save_state(const char *state) {
@@ -641,6 +663,20 @@ int exfat_shrink_live(const char *drive, uint64_t target, const char *directory)
 
             read_journal(i, 1, b);
 
+#ifdef EXFAT_TEST_FAULTS
+            char fault[64] = {0};
+            GetEnvironmentVariableA("EXFAT_TEST_FAULT", fault, sizeof(fault));
+            if ((offset == 0 && !strcmp(fault, "torn-boot")) ||
+                (offset == 12ull * sector_bytes && !strcmp(fault, "torn-backup"))) {
+                read_journal(i, 0, a);
+                memcpy(a, b, 84);
+                if (!raw_io(live_volume, offset, a, sector_bytes, 1) ||
+                    !FlushFileBuffers(live_disk)) {
+                    fail("torn boot simulation write failed");
+                }
+                TerminateProcess(GetCurrentProcess(), 91);
+            }
+#endif
             if (!raw_io(live_volume, offset, b, sector_bytes, 1)) {
                 fail("live metadata update failed");
             }
@@ -721,8 +757,8 @@ int exfat_recover_live(const char *drive, const char *directory) {
     make_path(state_path, directory, "state.txt");
     FILE *state = _fsopen(state_path, "rb", _SH_DENYWR);
     char status[256] = {0};
-    if (!state || !fgets(status, sizeof(status), state)) {
-        fail("cannot read transaction state");
+    if (!recovery_state_read(state, status, sizeof(status))) {
+        fail("missing, invalid, incomplete, or nonrecoverable transaction state");
     }
     fclose(state);
     if (!strncmp(status, "COMMITTED", 9) || !strncmp(status, "PREPARING", 9)) {
@@ -838,16 +874,12 @@ int exfat_recover_live(const char *drive, const char *directory) {
         read_journal(i, 0, before);
         read_journal(i, 1, after);
         live_read(NULL, offset, present, sector_bytes);
-        if (memcmp(present, before, sector_bytes) && memcmp(present, after, sector_bytes)) {
-            /* Dirty marking changes only this mutable flag in the two boot sectors. */
-            if (offset != 0 && offset != 12ull * sector_bytes) {
-                fail("live sector differs from both journal versions; recovery refused");
-            }
-            before[106] |= 2;
-            if (memcmp(present, before, sector_bytes)) {
-                fail("live boot sector differs from journal; recovery refused");
-            }
-            read_journal(i, 0, before);
+        /* Interrupted writes may leave bytewise mixtures of the two recorded
+         * versions. Reject bytes outside that set; reconstruct and validate the
+         * full original filesystem before writing any recovery sectors. */
+        int boot_sector = offset == 0 || offset == 12ull * sector_bytes;
+        if (!recovery_sector_matches(before, after, present, sector_bytes, boot_sector)) {
+            fail("live sector contains bytes outside journal versions; recovery refused");
         }
         patch_write(&restore, offset, before, sector_bytes);
     }
